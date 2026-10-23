@@ -2,12 +2,18 @@
 
 namespace LaraGram\Auth;
 
-use App\Models\User;
 use LaraGram\Auth\Access\Gate;
+use LaraGram\Auth\Middleware\RequirePassword;
+use LaraGram\Auth\Status\StatusManager;
 use LaraGram\Contracts\Auth\Access\Gate as GateContract;
 use LaraGram\Contracts\Auth\Authenticatable as AuthenticatableContract;
+use LaraGram\Contracts\Auth\StatusProvider as StatusProviderContract;
+use LaraGram\Contracts\Routing\ResponseFactory;
+use LaraGram\Contracts\Routing\UrlGenerator;
+use LaraGram\Listening\Listen;
 use LaraGram\Request\Request;
 use LaraGram\Support\Facades\Bot;
+use LaraGram\Support\Facades\Gate as GateFacade;
 use LaraGram\Support\ServiceProvider;
 
 class AuthServiceProvider extends ServiceProvider
@@ -22,14 +28,30 @@ class AuthServiceProvider extends ServiceProvider
         $this->registerAuthenticator();
         $this->registerUserResolver();
         $this->registerAccessGate();
+        $this->registerRequirePassword();
+        $this->registerStatusManager();
         $this->registerRequestRebindHandler();
+        $this->registerEventRebindHandler();
 
-
-        if ($this->app['config']->get('auth.observe_users_status', false)){
+        if ($this->app['auth.status']->shouldObserve()) {
             $this->registerListens();
         }
 
         $this->registerGates();
+    }
+
+    /**
+     * Register the chat-member status manager.
+     *
+     * @return void
+     */
+    protected function registerStatusManager()
+    {
+        $this->app->singleton('auth.status', fn ($app) => new StatusManager($app));
+
+        $this->app->alias('auth.status', StatusManager::class);
+
+        $this->app->bind(StatusProviderContract::class, fn ($app) => $app['auth.status']->driver());
     }
 
     /**
@@ -40,6 +62,24 @@ class AuthServiceProvider extends ServiceProvider
     protected function registerAuthenticator()
     {
         $this->app->singleton('auth', fn($app) => new AuthManager($app));
+
+        $this->app->singleton('auth.driver', fn($app) => $app['auth']->guard());
+    }
+
+    /**
+     * Register the "require password" middleware binding.
+     *
+     * @return void
+     */
+    protected function registerRequirePassword()
+    {
+        $this->app->bind(RequirePassword::class, function ($app) {
+            return new RequirePassword(
+                $app[ResponseFactory::class],
+                $app[UrlGenerator::class],
+                $app['config']->get('auth.password_timeout')
+            );
+        });
     }
 
     /**
@@ -71,79 +111,87 @@ class AuthServiceProvider extends ServiceProvider
      */
     protected function registerRequestRebindHandler()
     {
-        $this->app->rebinding('request', function ($app, $request) {
-            $request->setUserResolver(function () use ($app) {
-                return call_user_func($app['auth']->userResolver());
+        $resolver = function ($app, $request) {
+            $request->setUserResolver(function ($guard = null) use ($app) {
+                return call_user_func($app['auth']->userResolver(), $guard);
             });
+        };
+
+        $this->app->rebinding('request', $resolver);
+        $this->app->rebinding('http.request', $resolver);
+    }
+
+    /**
+     * Handle the re-binding of the event dispatcher binding.
+     *
+     * @return void
+     */
+    protected function registerEventRebindHandler()
+    {
+        $this->app->rebinding('events', function ($app, $dispatcher) {
+            if (! $app->resolved('auth') ||
+                $app['auth']->hasResolvedGuards() === false) {
+                return;
+            }
+
+            if (method_exists($guard = $app['auth']->guard(), 'setDispatcher')) {
+                $guard->setDispatcher($dispatcher);
+            }
         });
     }
 
+    /**
+     * Register a gate per Telegram chat-member status, backed by the status manager.
+     *
+     * The gates ignore the resolved user model and delegate to the configured
+     * status driver, so they work with the live, eloquent, database or cache
+     * driver alike and never couple the framework to the application's model.
+     *
+     * @return void
+     */
     public function registerGates()
     {
-        foreach ([
-                     'creator',
-                     'administrator',
-                     'member',
-                     'restricted',
-                     'left',
-                     'kicked'
-                 ] as $status) {
-            \LaraGram\Support\Facades\Gate::define($status, function (User $user) use ($status) {
-                return $user->status === $status;
-            });
+        foreach (Listen::$allStatuses as $status) {
+            GateFacade::define($status, fn ($user = null) => $this->app['auth.status']->is($status));
         }
     }
 
+    /**
+     * Listen for chat-member changes and persist them through the status driver.
+     *
+     * @return void
+     */
     public function registerListens()
     {
         Bot::onChatMember(function (Request $request) {
-            $user_id = $request->chat_member->new_chat_member->user->id;
-            $chat_id = $request->chat_member->chat->id;
-            $first_name = $request->chat_member->new_chat_member->user->first_name;
-            $last_name = $request->chat_member->new_chat_member->user->last_name ?? '';
-            $status = $request->chat_member->new_chat_member->status;
-
-            $user = User::where('user_id', $user_id)
-                ->where('chat_id', $chat_id)
-                ->first();
-
-            if (!$user) {
-                User::create([
-                    'user_id' => $user_id,
-                    'chat_id' => $chat_id,
-                    'first_name' => $first_name,
-                    'last_name' => $last_name,
-                    'status' => $status,
-                ]);
-            } else {
-                $user->status = $status;
-                $user->save();
-            }
+            $this->storeStatus(
+                $request->chat_member->new_chat_member->user,
+                $request->chat_member->chat,
+                $request->chat_member->new_chat_member->status
+            );
         })->name('laragram-auth-chat-member');
 
         Bot::onMyChatMember(function (Request $request) {
-            $user_id = $request->my_chat_member->new_chat_member->user->id;
-            $chat_id = $request->my_chat_member->chat->id;
-            $first_name = $request->my_chat_member->new_chat_member->user->first_name;
-            $last_name = $request->my_chat_member->new_chat_member->user->last_name ?? '';
-            $status = $request->my_chat_member->new_chat_member->status;
-
-            $user = User::where('user_id', $user_id)
-                ->where('chat_id', $chat_id)
-                ->first();
-
-            if (!$user) {
-                User::create([
-                    'user_id' => $user_id,
-                    'chat_id' => $chat_id,
-                    'first_name' => $first_name,
-                    'last_name' => $last_name,
-                    'status' => $status,
-                ]);
-            } else {
-                $user->status = $status;
-                $user->save();
-            }
+            $this->storeStatus(
+                $request->my_chat_member->new_chat_member->user,
+                $request->my_chat_member->chat,
+                $request->my_chat_member->new_chat_member->status
+            );
         })->name('laragram-auth-my-chat-member');
+    }
+
+    /**
+     * Persist a chat-member status change through the status manager.
+     *
+     * @param  object  $user
+     * @param  object  $chat
+     * @param  string  $status
+     * @return void
+     */
+    private function storeStatus($user, $chat, $status)
+    {
+        $this->app['auth.status']->record($user->id, $chat->id, [
+            'status'     => $status,
+        ]);
     }
 }
